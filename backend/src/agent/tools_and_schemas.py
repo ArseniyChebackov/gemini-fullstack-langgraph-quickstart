@@ -24,11 +24,11 @@ class Reflection(BaseModel):
 
 
 class WebSource(BaseModel):
-    title: str = Field(description="Title of the source")
-    url: str = Field(description="URL of the source")
-    snippet: str = Field(description="Short snippet or excerpt from the source")
+    title: str = Field(description="Title of the source document or file")
+    url: str = Field(description="URL or file path of the source")
+    snippet: str = Field(description="A relevant snippet from the source content")
 
 
 class WebSearchResult(BaseModel):
-    summary: str = Field(description="A synthesized summary of search findings")
-    sources: List[WebSource] = Field(description="List of sources used for the summary")
+    summary: str = Field(description="Summary of the search results")
+    sources: List[WebSource] = Field(description="List of source documents found")

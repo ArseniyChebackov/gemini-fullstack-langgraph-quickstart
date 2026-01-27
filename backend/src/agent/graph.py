@@ -23,17 +23,24 @@ from agent.prompts import (
     answer_instructions,
 )
 from agent.groq_client import GroqLLM
-from agent.tools_and_schemas import WebSearchResult
-from agent.utils import get_research_topic
+from agent.local_search import search_local_directory
+from agent.utils import (
+    get_research_topic,
+)
 
 load_dotenv()
+
+# Groq API key from environment
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY environment variable is not set")
 
 
 # Nodes
 def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerationState:
     """LangGraph node that generates search queries based on the User's question.
 
-    Uses Gemini 2.0 Flash to create an optimized search queries for web research based on
+    Uses Groq LLM to create optimized search queries for research based on
     the User's question.
 
     Args:
@@ -49,11 +56,11 @@ def generate_query(state: OverallState, config: RunnableConfig) -> QueryGenerati
     if state.get("initial_search_query_count") is None:
         state["initial_search_query_count"] = configurable.number_of_initial_queries
 
-    # init Groq LLM (llama-3.3-70b-versatile)
+    # init Groq LLM
     llm = GroqLLM(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        model=configurable.query_generator_model or "llama-3.3-70b-versatile",
         temperature=1.0,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=GROQ_API_KEY,
     )
     structured_llm = llm.with_structured_output(SearchQueryList)
 
@@ -81,58 +88,47 @@ def continue_to_web_research(state: QueryGenerationState):
 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> OverallState:
-    """LangGraph node that performs web research using the native Google Search API tool.
+    """LangGraph node that performs research using local documents or web search.
 
-    Executes a web search using the native Google Search API tool in combination with Gemini 2.0 Flash.
+    Uses local document search if search_dir is provided, otherwise uses Groq LLM.
 
     Args:
         state: Current graph state containing the search query and research loop count
-        config: Configuration for the runnable, including search API settings
+        config: Configuration for the runnable, including search settings
 
     Returns:
-        Dictionary with state update, including sources_gathered, research_loop_count, and web_research_results
+        Dictionary with state update, including sources_gathered and web_research_result
     """
     # Configure
     configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=state["search_query"],
-    )
-
-    # Use Groq to perform web research and return structured JSON. We ask the
-    # model to perform searches and return a JSON with `summary` and `sources`.
-    llm = GroqLLM(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        temperature=0,
-        api_key=os.getenv("GROQ_API_KEY"),
-    )
-    structured = llm.with_structured_output(WebSearchResult)
-
-    # Augment the prompt to request structured JSON output
-    structured_prompt = (
-        formatted_prompt
-        + "\n\nRespond ONLY with a JSON object with keys: `summary` (string) and `sources` (list of {title,url,snippet})."
-    )
-
-    result = structured.invoke(structured_prompt)
-
-    # Normalize sources into the shape expected by the rest of the graph
-    sources_gathered = []
-    for s in result.sources:
-        sources_gathered.append(
-            {
-                "title": s.title,
-                "value": s.url,
-                "short_url": s.url,
-                "snippet": s.snippet,
-            }
+    
+    # Check if local search is enabled
+    if state.get("search_dir"):
+        # Use local document search
+        search_result = search_local_directory(state["search_query"], state["search_dir"])
+        return {
+            "sources_gathered": search_result.sources if hasattr(search_result, 'sources') else [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [search_result.summary if hasattr(search_result, 'summary') else str(search_result)],
+        }
+    else:
+        # Use Groq LLM for research
+        formatted_prompt = web_searcher_instructions.format(
+            current_date=get_current_date(),
+            research_topic=state["search_query"],
         )
-
-    return {
-        "sources_gathered": sources_gathered,
-        "search_query": [state["search_query"]],
-        "web_research_result": [result.summary],
-    }
+        llm = GroqLLM(
+            model=configurable.query_generator_model or "llama-3.3-70b-versatile",
+            temperature=0,
+            api_key=GROQ_API_KEY,
+        )
+        result = llm.invoke(formatted_prompt)
+        
+        return {
+            "sources_gathered": result.sources if hasattr(result, 'sources') else [],
+            "search_query": [state["search_query"]],
+            "web_research_result": [result.summary if hasattr(result, 'summary') else str(result)],
+        }
 
 
 def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
@@ -152,7 +148,7 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
     configurable = Configuration.from_runnable_config(config)
     # Increment the research loop count and get the reasoning model
     state["research_loop_count"] = state.get("research_loop_count", 0) + 1
-    reasoning_model = state.get("reasoning_model", configurable.reflection_model)
+    reasoning_model = state.get("reasoning_model", configurable.reflection_model or "llama-3.3-70b-versatile")
 
     # Format the prompt
     current_date = get_current_date()
@@ -161,11 +157,11 @@ def reflection(state: OverallState, config: RunnableConfig) -> ReflectionState:
         research_topic=get_research_topic(state["messages"]),
         summaries="\n\n---\n\n".join(state["web_research_result"]),
     )
-    # init Reasoning Model on Groq (llama-3.3-70b-versatile)
+    # init Groq LLM for reflection
     llm = GroqLLM(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        model=reasoning_model,
         temperature=1.0,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=GROQ_API_KEY,
     )
     result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
 
@@ -226,10 +222,10 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         state: Current graph state containing the running summary and sources gathered
 
     Returns:
-        Dictionary with state update, including running_summary key containing the formatted final summary with sources
+        Dictionary with state update, including messages key containing the formatted final answer
     """
     configurable = Configuration.from_runnable_config(config)
-    reasoning_model = state.get("reasoning_model") or configurable.answer_model
+    reasoning_model = state.get("reasoning_model") or configurable.answer_model or "llama-3.3-70b-versatile"
 
     # Format the prompt
     current_date = get_current_date()
@@ -239,26 +235,17 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
         summaries="\n---\n\n".join(state["web_research_result"]),
     )
 
-    # init Reasoning Model on Groq (llama-3.3-70b-versatile)
+    # init Reasoning Model using Groq
     llm = GroqLLM(
-        model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        model=reasoning_model,
         temperature=0,
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=GROQ_API_KEY,
     )
     result = llm.invoke(formatted_prompt)
 
-    # Replace the short urls with the original urls and add all used urls to the sources_gathered
-    unique_sources = []
-    for source in state["sources_gathered"]:
-        if source["short_url"] in result.content:
-            result.content = result.content.replace(
-                source["short_url"], source["value"]
-            )
-            unique_sources.append(source)
-
     return {
         "messages": [AIMessage(content=result.content)],
-        "sources_gathered": unique_sources,
+        "sources_gathered": state.get("sources_gathered", []),
     }
 
 
